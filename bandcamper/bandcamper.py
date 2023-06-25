@@ -6,16 +6,18 @@ from urllib.parse import urljoin
 from urllib.parse import urlparse
 from zipfile import ZipFile
 
+import click
+import requests
 from bs4 import BeautifulSoup
 from onesecmail import OneSecMail
 from onesecmail.validators import FromAddressValidator
-from requests import HTTPError
 
 from bandcamper.metadata.utils import get_track_output_context
 from bandcamper.metadata.utils import suffix_to_metadata
-from bandcamper.requests.requester import Requester
 from bandcamper.screamo import Screamer
+from bandcamper.utils import get_download_file_extension
 from bandcamper.utils import get_random_filename_template
+from bandcamper.utils import get_random_user_agent
 
 
 class Bandcamper:
@@ -60,30 +62,48 @@ class Bandcamper:
     def __init__(
         self,
         *urls,
-        fallback=True,
-        force_https=True,
-        screamer=None,
-        requester=None,
+        **kwargs,
     ):
+        # TODO: properly set kwargs
         self.urls = set()
-        self.fallback = fallback
-        self.force_https = force_https
-        self.screamer = screamer or Screamer()
-        self.requester = requester or Requester()
+        self.fallback = kwargs.pop("fallback", True)
+        self.force_https = kwargs.pop("force_https", True)
+        self.proxies = {
+            "http": kwargs.pop("http_proxy", None),
+            "https": kwargs.pop("https_proxy", None),
+        }
+        self.headers = {"User-Agent": get_random_user_agent()}
+        self.screamer = kwargs.pop("screamer", Screamer())
         for url in urls:
             self.add_url(url)
 
+    def cleanup_path(path):
+        return Path(str(path).replace('|', '').replace('>', '').replace('<', '').replace(':', '').replace('*', '').replace('\"', '').replace('?', '').replace('\\ ', '\\').replace(' \\', '\\'))
+
+    def _request_or_error(self, method, url, **kwargs):
+        proxies = {**self.proxies, **kwargs.pop("proxies", {})}
+        headers = {**self.headers, **kwargs.pop("headers", {})}
+        response = requests.request(
+            method, url, proxies=proxies, headers=headers, **kwargs
+        )
+        response.raise_for_status()
+        return response
+
+    def _get_request_or_error(self, url, **kwargs):
+        return self._request_or_error("GET", url, **kwargs)
+
+    def _post_request_or_error(self, url, **kwargs):
+        return self._request_or_error("POST", url, **kwargs)
+
     def _is_valid_custom_domain(self, url):
-        return self.requester.get_ip_from_url(url) == self.CUSTOM_DOMAIN_IP
+        response = self._get_request_or_error(url, stream=True)
+        return response.raw._connection.sock.getpeername()[0] == self.CUSTOM_DOMAIN_IP
 
     def _add_urls_from_artist(self, source_url):
-        response = self.requester.get_request_or_error(source_url)
+        response = self._get_request_or_error(source_url)
         base_url = "https://" + urlparse(source_url).netloc.strip("/ ")
         soup = BeautifulSoup(response.content, "lxml")
-        music_grid = soup.find("ol", id="music-grid")
-        if music_grid is None:
-            raise ValueError
-        for a in music_grid.find_all("a"):
+        for a in soup.find("ol", id="music-grid").find_all("a"):
             parsed_url = urlparse(a.get("href"))
             if parsed_url.scheme:
                 url = urljoin(
@@ -97,15 +117,7 @@ class Bandcamper:
     def add_url(self, name):
         if self.BANDCAMP_SUBDOMAIN_REGEX.fullmatch(name):
             url = f"https://{name.lower()}.bandcamp.com/music"
-            try:
-                self._add_urls_from_artist(url)
-            except HTTPError as exc:
-                if exc.response.status_code == 404:
-                    self.screamer.error(f"{name} not found")
-                else:
-                    self.screamer.error(f"Request error while getting URLs for {name}")
-            except ValueError:
-                self.screamer.error(f"No releases found for {name}")
+            self._add_urls_from_artist(url)
         else:
             parsed_url = urlparse(name)
             if not parsed_url.scheme:
@@ -125,25 +137,37 @@ class Bandcamper:
                 raise ValueError(f"{name} is not a valid Bandcamp URL or subdomain")
 
     def _get_music_data(self, url):
-        try:
-            response = self.requester.get_request_or_error(url)
-        except HTTPError as exc:
-            if exc.response.status_code == 404:
-                raise ValueError(f"{url} not found")
-            raise exc
-        else:
-            soup = BeautifulSoup(response.content, "lxml")
-            data = json.loads(
-                soup.find("script", {"data-tralbum": True})["data-tralbum"]
-            )
-            data["art_url"] = soup.select_one("div#tralbumArt > a.popupImage")["href"]
-            from_album_span = soup.select_one("span.fromAlbum")
-            if from_album_span is not None:
-                data["album_title"] = from_album_span.text
-            return data
+        response = self._get_request_or_error(url)
+        soup = BeautifulSoup(response.content, "lxml")
+        data = json.loads(soup.find("script", {"data-tralbum": True})["data-tralbum"])
+        data["art_url"] = soup.select_one("div#tralbumArt > a.popupImage")["href"]
+        from_album_span = soup.select_one("span.fromAlbum")
+        if from_album_span is not None:
+            data["album_title"] = from_album_span.text
+        return data
 
-    def _free_download(self, url, destination, item_type, *download_formats):
-        response = self.requester.get_request_or_error(url)
+    def download_to_file(self, url, save_path, filename):
+        with requests.get(
+            url, stream=True, proxies=self.proxies, headers=self.headers
+        ) as response:
+            response.raise_for_status()
+            file_ext = get_download_file_extension(response.headers.get("Content-Type"))
+            file_path = Path(save_path)
+            file_path.mkdir(parents=True, exist_ok=True)
+            file_path /= filename.format(ext=file_ext)
+            file_path = Path(str(file_path).replace('|', '').replace('\\ ', '\\').replace(' \\', '\\'))
+            with file_path.open("wb") as file:
+                with click.progressbar(
+                    response.iter_content(chunk_size=1024),
+                    length=int(response.headers.get("Content-Length")) // 1024,
+                    label=file_path.name,
+                ) as bar:
+                    for chunk in bar:
+                        file.write(chunk)
+        return file_path
+
+    def _free_download(self, url, destination, *download_formats):
+        response = self._get_request_or_error(url)
         soup = BeautifulSoup(response.content, "lxml")
         download_data = json.loads(soup.find("div", id="pagedata")["data-blob"])
         downloadable = download_data["download_items"][0]["downloads"]
@@ -153,10 +177,10 @@ class Bandcamper:
                 parsed_url = urlparse(downloadable[fmt]["url"])
                 stat_path = parsed_url.path.replace("/download/", "/statdownload/")
                 fwd_url = parsed_url._replace(path=stat_path).geturl()
-                fwd_data = self.requester.get_request_or_error(
+                fwd_data = self._get_request_or_error(
                     fwd_url,
                     params={".vrs": 1},
-                    headers={"Accept": "application/json"},
+                    headers={**self.headers, "Accept": "application/json"},
                 ).json()
                 if fwd_data["result"].lower() == "ok":
                     download_url = fwd_data["download_url"]
@@ -165,12 +189,8 @@ class Bandcamper:
                 else:
                     self.screamer.error(f"Error downloading {fmt} from {fwd_url}")
                     continue
-                label = f"{fmt}.zip" if item_type == "album" else None
-                file_path = self.requester.download_to_file(
-                    download_url,
-                    destination,
-                    get_random_filename_template(),
-                    label,
+                file_path = self.download_to_file(
+                    download_url, destination, get_random_filename_template()
                 )
                 if file_path.suffix == ".zip":
                     extract_to_path = file_path.parent / file_path.stem
@@ -197,8 +217,7 @@ class Bandcamper:
         artist_subdomain = urlparse(url).netloc
         download_url = f"https://{artist_subdomain}/email_download"
         mailbox = OneSecMail.generate_random_mailbox(
-            proxies=self.requester.session.proxies,
-            headers=self.requester.session.headers,
+            proxies=self.proxies, headers=self.headers
         )
         form_data = {
             "encoding_name": encoding_name,
@@ -208,7 +227,7 @@ class Bandcamper:
             "country": country,
             "postcode": postcode,
         }
-        response = self.requester.post_request_or_error(download_url, data=form_data)
+        response = self._post_request_or_error(download_url, data=form_data)
         if not response.json()["ok"]:
             raise ValueError(f"Email download request failed: {response.text}")
         msgs = []
@@ -231,6 +250,7 @@ class Bandcamper:
             output = output_extra
             context["filename"] = file_path.name
         move_to = destination / output.format(**context)
+        move_to = Path(str(move_to).replace('|', '').replace('\\ ', '\\').replace(' \\', '\\'))
         move_to.parent.mkdir(parents=True, exist_ok=True)
         file_path.replace(move_to)
         return move_to
@@ -239,13 +259,11 @@ class Bandcamper:
         file_paths = []
         for track in track_info:
             if track.get("file"):
-                track_num = f"{track['track_num']:02d}"
                 file_paths.append(
-                    self.requester.download_to_file(
+                    self.download_to_file(
                         track["file"]["mp3-128"],
                         destination,
-                        f"{artist} - {album} - {track_num} {track['title']}{{ext}}",
-                        f"{track_num}.mp3",
+                        f"{artist} - {album} - {track['track_num']:02d} {track['title']}{{ext}}",
                     )
                 )
         return file_paths
@@ -261,18 +279,8 @@ class Bandcamper:
             download_formats.remove("mp3-128")
             download_mp3 = True
 
-        music_data = dict()
-        try:
-            music_data = self._get_music_data(url)
-        except ValueError as exc:
-            self.screamer.error(str(exc))
-            return
-        except HTTPError as exc:
-            self.screamer.error(
-                f"Request error ({exc.response.status_code}) when getting music data from {url}"
-            )
-            return
-        if not music_data:
+        music_data = self._get_music_data(url)
+        if music_data is None:
             self.screamer.error(f"Failed to get music data from {url}")
             return
 
@@ -285,20 +293,14 @@ class Bandcamper:
             if music_data["item_type"] == "album"
             else music_data.get("album_title", "")
         )
-        year = (
-            music_data["current"].get("release_date")
-            or music_data["current"]["publish_date"]
-        ).split()[2]
+        year = music_data["current"]["release_date"].split()[2]
         title = music_data["current"]["title"]
         downloading_str = f"Downloading {artist} - {title}"
 
         if music_data.get("freeDownloadPage"):
             self.screamer.success(f"Free download found! {downloading_str}")
             file_paths = self._free_download(
-                music_data["freeDownloadPage"],
-                destination,
-                music_data["item_type"],
-                *download_formats,
+                music_data["freeDownloadPage"], destination, *download_formats
             )
         elif music_data["current"].get("require_email"):
             self.screamer.success(f"Email download found! {downloading_str}")
@@ -306,7 +308,7 @@ class Bandcamper:
                 url, music_data["id"], music_data["item_type"]
             )
             file_paths = self._free_download(
-                download_url, destination, music_data["item_type"], *download_formats
+                download_url, destination, *download_formats
             )
         elif self.fallback or download_mp3:
             self.screamer.success(f"MP3-128 download found! {downloading_str}")
@@ -332,6 +334,7 @@ class Bandcamper:
             "year": year,
         }
         for file_path in file_paths:
+            file_path = Path(str(file_path).replace('|', '').replace('\\ ', '\\').replace(' \\', '\\'))
             if file_path.is_dir():
                 for track_path in file_path.iterdir():
                     new_path = self.move_file(
@@ -340,15 +343,14 @@ class Bandcamper:
                     self.screamer.success(
                         f"New file: {new_path}", verbose=True, short_symbol=True
                     )
-                self.screamer.success(
-                    f"New directory: {new_path.parent}", short_symbol=True
-                )
                 file_path.rmdir()
             else:
                 new_path = self.move_file(
                     file_path, destination, output, output_extra, tracks, context
                 )
-                self.screamer.success(f"New file: {new_path}", short_symbol=True)
+                self.screamer.success(
+                    f"New file: {new_path}", verbose=True, short_symbol=True
+                )
 
     def download_all(self, destination, output, output_extra, *download_formats):
         for url in self.urls:
